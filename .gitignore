@@ -8,6 +8,7 @@ node_modules/
 # Exclude these specific folders
 hf-embed-service/
 vector-services/
+weaviate-service/
 
 # OS and build artifacts
 .DS_Store
@@ -15,5 +16,3 @@ Thumbs.db
 __pycache__/
 *.pyc
 
-# Other temporary files
-frontend.zip

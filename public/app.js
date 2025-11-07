@@ -301,16 +301,20 @@ class ChatBubble {
 
   async handleProductQuery(message) {
     try {
-      // Prior implementation used a local Weaviate semantic search. Removed.
+      // Try semantic vector search first (via Node proxy -> vector-services)
+      const semantic = await this.searchProductsSemantic(message);
+      let products = semantic && semantic.length ? semantic : [];
 
-      // Try LLM-driven extraction first
-      const llmProducts = await this.searchProductsLLM(message);
-      let products = llmProducts && llmProducts.length ? llmProducts : [];
+      // Then try LLM-driven extraction
+      if (!products.length) {
+        const llmProducts = await this.searchProductsLLM(message);
+        products = llmProducts && llmProducts.length ? llmProducts : products;
+      }
 
       if (!products.length) {
         // fallback to direct Shopify keyword search
         const direct = await this.searchProductsDirect(message);
-        products = direct && direct.length ? direct : [];
+        products = direct && direct.length ? direct : products;
       }
 
       this.hideTypingIndicator();
@@ -339,8 +343,7 @@ class ChatBubble {
               p.priceRange.minVariantPrice &&
               p.priceRange.minVariantPrice.currencyCode) ||
             "";
-          const img =
-            p.featuredImage && p.featuredImage.url ? p.featuredImage.url : "";
+          const img = resolveImageFromProduct(p) || '';
           const href = this.buildProductUrl(handle);
           const addButton =
             p.variants &&
@@ -406,6 +409,62 @@ class ChatBubble {
     }
   }
 
+  // New: semantic search via server proxy -> vector-services
+  async searchProductsSemantic(query) {
+    try {
+      const tryQuery = async (q) => {
+        const url = `${this.apiBaseUrl}/api/vector/search?query=${encodeURIComponent(q)}`;
+        console.log('searchProductsSemantic ->', url);
+        const res = await fetch(url, { method: 'GET' });
+        if (!res.ok) {
+          console.warn('searchProductsSemantic HTTP error', res.status);
+          return [];
+        }
+        const data = await res.json();
+        // Vector service may return { products: [...] } or { results: [...], total, next_cursor }
+        if (Array.isArray(data.products) && data.products.length) return data.products;
+        if (Array.isArray(data.results) && data.results.length) {
+          return data.results.map(r => ({
+            title: r.title || '',
+            handle: r.handle || (r.product_id ? String(r.product_id) : ''),
+            description: r.description || '',
+            tags: r.tags || [],
+            featuredImage: { url: r.image || '' },
+            variants: [],
+            _score: r.score,
+            _certainty: r.certainty,
+            product_id: r.product_id
+          }));
+        }
+        return [];
+      };
+
+      // First attempt: raw query
+      let products = await tryQuery(query);
+      if (products && products.length) return products;
+
+      // Second attempt: simple keyword extraction (strip stopwords / filler words)
+      const cleaned = (query || '')
+        .toLowerCase()
+        .replace(/[.,!?"'():]/g, ' ')
+        .replace(/\b(show|me|some|please|find|the|a|an|for|with|in|on|of|this|that|these|those|i|need|want)\b/gi, ' ')
+        .split(/\s+/)
+        .filter(t => t && t.length > 2)
+        .slice(0,6)
+        .join(' ');
+
+      if (cleaned && cleaned.length) {
+        console.log('searchProductsSemantic retry with cleaned keywords ->', cleaned);
+        products = await tryQuery(cleaned);
+      }
+
+      return products || [];
+    } catch (err) {
+      console.warn('searchProductsSemantic failed', err);
+      return [];
+    }
+  }
+
   async searchProductsLLM(query) {
     try {
       const res = await fetch(`${this.apiBaseUrl}/api/chat/llm_search`, {
@@ -424,21 +483,51 @@ class ChatBubble {
 
   async searchProductsDirect(query) {
     try {
-      const res = await fetch(
-        `${this.apiBaseUrl}/api/shopify/products/search?q=${encodeURIComponent(
-          query
-        )}`
-      );
-      if (!res.ok) return [];
+      const url = `${this.apiBaseUrl}/api/vector/search?query=${encodeURIComponent(query)}&limit=20&min_score=0.6`;
+      console.log('searchProductsDirect ->', url);
+  
+      const res = await fetch(url, { method: 'GET' });
+      if (!res.ok) {
+        console.warn('searchProductsDirect HTTP error', res.status);
+        return [];
+      }
+  
       const data = await res.json();
+      console.log('searchProductsDirect raw data', data);
+  
+      // ✅ Handle the shape returned by your vector service ({ results: [...] })
+      if (Array.isArray(data.results)) {
+        return data.results.map(r => ({
+          product_id: r.product_id || r.id || null,
+          title: r.title || r.name || '',
+          handle: r.handle || '',
+          description: r.description || '',
+          tags: Array.isArray(r.tags) ? r.tags : [],
+          featuredImage: (r.featuredImage && { url: r.featuredImage.url, altText: r.featuredImage.altText }) || null,
+          variants: (r.variants && Array.isArray(r.variants) ? r.variants : []),
+          priceRange: r.priceRange || undefined,
+          _vector_meta: { score: r.score, certainty: r.certainty, raw: r }
+        }));
+      }
+  
+      // ✅ Fallback: if the vector service returns data.products
       if (Array.isArray(data.products)) return data.products;
-      const edges = data?.data?.products?.edges || [];
-      return edges.map((e) => e.node || {});
+  
+      // ✅ Fallback: Shopify-style structure
+      if (data?.data?.products?.edges && Array.isArray(data.data.products.edges)) {
+        return data.data.products.edges.map(e => e.node || {});
+      }
+  
+      // ✅ If API returned array directly
+      if (Array.isArray(data)) return data;
+  
+      return [];
     } catch (err) {
       console.warn("searchProductsDirect failed", err);
       return [];
     }
   }
+  
 
   async getProducts() {
     try {
@@ -497,6 +586,53 @@ class ChatBubble {
       ])
     );
   }
+}
+
+// Image helper: normalize and resolve common product image shapes
+function normalizeImageUrl(raw) {
+  if (!raw) return null;
+  try {
+    let url = String(raw).trim();
+    if (!url) return null;
+    // protocol-relative
+    if (url.startsWith('//')) url = window.location.protocol + url;
+    // avoid mixed-content: upgrade http -> https when page is secure
+    if (window.location.protocol === 'https:' && url.startsWith('http:')) {
+      url = 'https:' + url.slice(5);
+    }
+    return url;
+  } catch (e) {
+    return null;
+  }
+}
+
+function resolveImageFromProduct(p) {
+  if (!p) return null;
+  const candidates = [];
+  if (typeof p === 'string') candidates.push(p);
+  if (p.featuredImage) {
+    if (typeof p.featuredImage === 'string') candidates.push(p.featuredImage);
+    else if (p.featuredImage.url) candidates.push(p.featuredImage.url);
+  }
+  if (p.featured_image) candidates.push(p.featured_image);
+  if (p.image) candidates.push(p.image);
+  if (p.featuredImageUrl) candidates.push(p.featuredImageUrl);
+  if (p.featured_image_url) candidates.push(p.featured_image_url);
+  if (p.url) candidates.push(p.url);
+  if (p.images && Array.isArray(p.images) && p.images.length) {
+    const first = p.images[0];
+    if (first && typeof first === 'string') candidates.push(first);
+    if (first && first.src) candidates.push(first.src);
+  }
+  if (p.image && typeof p.image === 'object') {
+    if (p.image.src) candidates.push(p.image.src);
+  }
+
+  for (const c of candidates) {
+    const n = normalizeImageUrl(c);
+    if (n) return n;
+  }
+  return null;
 }
 
 // Initialize after DOM ready

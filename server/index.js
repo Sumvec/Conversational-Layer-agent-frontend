@@ -32,11 +32,19 @@ const SHOP = process.env.SHOPIFY_STORE_DOMAIN || process.env.SHOPIFY_SHOP_DOMAIN
 const STOREFRONT_TOKEN = process.env.SHOPIFY_STOREFRONT_ACCESS_TOKEN;
 const API_VERSION = process.env.SHOPIFY_API_VERSION || '2024-10';
 
+// New: external python services configuration
+const HF_EMBED_URL = process.env.HF_EMBED_URL || 'http://localhost:7000';
+const VECTOR_SERVICE_URL = process.env.VECTOR_SERVICE_URL || 'http://localhost:8000';
+const VECTOR_SHOP_ID = process.env.VECTOR_SHOP_ID || SHOP || '';
+const VECTOR_API_KEY = process.env.VECTOR_API_KEY || process.env.VECTOR_SERVICE_API_KEY || '';
+
 console.log('🚀 Server starting');
 console.log('   🏬 Shopify Domain:', SHOP);
 console.log('   🔑 Storefront Token:', STOREFRONT_TOKEN ? '✅ Set' : '❌ Missing');
 console.log('   💬 Ollama Model:', OLLAMA_MODEL);
 console.log('   🌐 Ollama Base URL:', OLLAMA_BASE_URL);
+console.log('   🧠 HF Embed URL:', HF_EMBED_URL);
+console.log('   📡 Vector Service URL:', VECTOR_SERVICE_URL);
 
 // In-memory chat history
 const chatHistory = new Map();
@@ -375,6 +383,69 @@ app.post('/api/chat/llm_search', async (req, res) => {
   } catch (err) {
     console.error('❌ /api/chat/llm_search error:', err.response?.data || err.message || err);
     res.status(500).json({ error: 'LLM-driven search failed', details: err.message || err });
+  }
+});
+
+// Proxy: Embeddings endpoint -> forwards to hf-embed-service /embed
+app.post('/api/embeddings', async (req, res) => {
+  try {
+    const body = req.body || {};
+    // Ensure body.texts is present as array
+    if (!Array.isArray(body.texts) || body.texts.length === 0) {
+      return res.status(400).json({ error: 'Request must include "texts": ["..."]' });
+    }
+    const resp = await axios.post(`${HF_EMBED_URL.replace(/\/+$/,'')}/embed`, body, { headers: { 'Content-Type': 'application/json' }, timeout: 20000 });
+    return res.json(resp.data);
+  } catch (err) {
+    console.error('❌ /api/embeddings proxy error', err.response?.data || err.message || err);
+    return res.status(500).json({ error: 'Embedding service error', details: err.message || err });
+  }
+});
+
+// Proxy: Vector search -> forwards to vector-services /search/products
+app.get('/api/vector/search', async (req, res) => {
+  try {
+    const query = req.query.query || '';
+    if (!query) return res.status(400).json({ error: 'query parameter is required' });
+
+    const params = {
+      query,
+      limit: req.query.limit || 20,
+      offset: req.query.offset || 0,
+      min_score: req.query.min_score || undefined
+    };
+
+    const headers = {
+      'x-shop-id': VECTOR_SHOP_ID,
+      'x-api-key': VECTOR_API_KEY
+    };
+
+    const resp = await axios.get(`${VECTOR_SERVICE_URL.replace(/\/+$/,'')}/api/v1/search/products`, { params, headers, timeout: 20000 });
+
+    // Return the vector service response as-is so frontend can decide how to use it
+    return res.json(resp.data);
+  } catch (err) {
+    console.error('❌ /api/vector/search proxy error', err.response?.data || err.message || err);
+    return res.status(500).json({ error: 'Vector search error', details: err.message || err });
+  }
+});
+
+// Simple health checks for the proxied services
+app.get('/api/health/embed', async (req, res) => {
+  try {
+    const resp = await axios.get(`${HF_EMBED_URL.replace(/\/+$/,'')}/health`, { timeout: 5000 });
+    return res.json({ ok: true, service: 'hf-embed', upstream: resp.data });
+  } catch (err) {
+    return res.status(502).json({ ok: false, service: 'hf-embed', error: err.message || err });
+  }
+});
+
+app.get('/api/health/vector', async (req, res) => {
+  try {
+    const resp = await axios.get(`${VECTOR_SERVICE_URL.replace(/\/+$/,'')}/health`, { timeout: 5000 });
+    return res.json({ ok: true, service: 'vector-service', upstream: resp.data });
+  } catch (err) {
+    return res.status(502).json({ ok: false, service: 'vector-service', error: err.message || err });
   }
 });
 

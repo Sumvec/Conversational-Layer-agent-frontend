@@ -23,6 +23,55 @@
   // expose to global so app.js can read it
   window.ChatBubbleConfig = CHAT_BUBBLE_CONFIG;
 
+  // Image helper: normalize and resolve common product image shapes
+  function normalizeImageUrl(raw) {
+    if (!raw) return null;
+    try {
+      let url = String(raw).trim();
+      if (!url) return null;
+      // protocol-relative
+      if (url.startsWith('//')) url = window.location.protocol + url;
+      // avoid mixed-content: upgrade http -> https when page is secure
+      if (window.location.protocol === 'https:' && url.startsWith('http:')) {
+        url = 'https:' + url.slice(5);
+      }
+      return url;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function resolveImageFromProduct(p) {
+    if (!p) return null;
+    const candidates = [];
+    if (typeof p === 'string') candidates.push(p);
+    if (p.featuredImage) {
+      if (typeof p.featuredImage === 'string') candidates.push(p.featuredImage);
+      else if (p.featuredImage.url) candidates.push(p.featuredImage.url);
+    }
+    if (p.image) candidates.push(p.image);
+    if (p.featured_image) candidates.push(p.featured_image);
+    if (p.featuredImageUrl) candidates.push(p.featuredImageUrl);
+    if (p.featured_image_url) candidates.push(p.featured_image_url);
+    if (p.url) candidates.push(p.url);
+    if (p.images && Array.isArray(p.images) && p.images.length) {
+      const first = p.images[0];
+      if (first && typeof first === 'string') candidates.push(first);
+      if (first && first.src) candidates.push(first.src);
+    }
+    if (p.image && typeof p.image === 'object') {
+      // some payloads use { src: '...' }
+      if (p.image.src) candidates.push(p.image.src);
+    }
+
+    for (const c of candidates) {
+      const n = normalizeImageUrl(c);
+      if (n) return n;
+    }
+    // no image found
+    return null;
+  }
+
   // Avoid double-loading
   if (window.__chatBubble_loader_loaded) {
     console.debug('shopify-app.js: loader already loaded');
@@ -166,15 +215,38 @@
       };
     }
 
+    // New: semantic vector search via server proxy -> vector-services
+    if (!window.chatBubble.searchProductsSemantic) {
+      window.chatBubble.searchProductsSemantic = async function(message) {
+        try {
+          const url = `${this.apiBaseUrl}/api/vector/search?query=${encodeURIComponent(message)}`;
+          const resp = await fetch(url, { method: 'GET' });
+          if (!resp.ok) { console.warn('Semantic search HTTP error', resp.status); return []; }
+          const data = await resp.json();
+          // vector service returns { intent, products }
+          return data.products || [];
+        } catch (err) {
+          console.error('Semantic search error', err);
+          return [];
+        }
+      };
+    }
+
     if (!window.chatBubble.searchProductsDirect) {
+      // fallback: fetch products list from server and filter locally
       window.chatBubble.searchProductsDirect = async function(query) {
         try {
-          const resp = await fetch(`${this.apiBaseUrl}/api/shopify/products/search?q=${encodeURIComponent(query)}`);
+          const resp = await fetch(`${this.apiBaseUrl}/api/shopify/products`);
           if (!resp.ok) { console.error('Direct search HTTP error', resp.status); return []; }
           const data = await resp.json();
-          if (Array.isArray(data.products)) return data.products;
-          const edges = data?.data?.products?.edges || [];
-          return edges.map(e => e.node || {});
+          const products = Array.isArray(data.products) ? data.products : (data?.data?.products?.edges || []).map(e => e.node || {});
+          const q = (query || '').toLowerCase();
+          return products.filter(p => {
+            const title = (p.title || '').toLowerCase();
+            const desc = (p.description || '').toLowerCase();
+            const handle = (p.handle || '').toLowerCase();
+            return q.split(/\s+/).some(t => t && (title.includes(t) || desc.includes(t) || handle.includes(t)));
+          });
         } catch (err) {
           console.error('Direct search error', err);
           return [];
@@ -215,7 +287,7 @@
         const message = (this.chatInput && this.chatInput.value) ? this.chatInput.value.trim() : '';
         if (!message) return;
 
-        // Product queries handled by llm_search pipeline
+        // Product queries handled by semantic -> llm -> direct pipeline
         if (isProductQuery(message)) {
           try {
             this.addMessage('user', message);
@@ -225,10 +297,16 @@
             this.setLoading(true);
             this.showTypingIndicator();
 
-            const products = await this.searchProductsLLM(message);
-            let results = products;
+            // FIRST: semantic vector search
+            let results = await this.searchProductsSemantic(message);
+
+            // SECOND: LLM-driven search if semantic returned nothing
             if (!results || results.length === 0) {
-              // fallback to direct keyword search
+              results = await this.searchProductsLLM(message);
+            }
+
+            // LAST: fallback to direct product list search
+            if (!results || results.length === 0) {
               const fallback = await this.searchProductsDirect(message);
               results = fallback && fallback.length ? fallback : [];
             }
@@ -244,7 +322,7 @@
             const html = results.slice(0,6).map(p => {
               const title = p.title || 'Untitled';
               const handle = p.handle || '';
-              const img = p.featuredImage?.url || '';
+              const img = resolveImageFromProduct(p) || '';
               const variant = p.variants?.[0] || {};
               const price = variant.price || p.priceRange?.minVariantPrice?.amount || '';
               const currency = variant.currency || p.priceRange?.minVariantPrice?.currencyCode || '';
