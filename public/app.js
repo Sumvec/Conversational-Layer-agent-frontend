@@ -1,6 +1,57 @@
 // public/app.js
 // Full fixed version (Option 2): uses #chatBubbleContainer to avoid window variable conflict.
 
+const VECTOR_WEBHOOK_URL = 'https://sage.sumvec.com/n8n/webhook/search-vector';
+
+async function postToWebhook(payload) {
+  try {
+    // Normalize payload to match Postman: { text: '...'}
+    const body = { text: payload && (payload.text || payload.message || payload.query || '') };
+    if (payload && payload.sessionId) body.sessionId = payload.sessionId;
+
+    const res = await fetch(VECTOR_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      // log response body for debugging
+      const text = await res.text().catch(() => '<no-body>');
+      console.warn('Webhook HTTP error', res.status, text);
+      return null;
+    }
+    const data = await res.json().catch(() => null);
+
+    // Normalize products array for many possible shapes (array, {products:[]}, {results:[]}, {results:{results:[]}})
+    let products = [];
+    if (!data) {
+      products = [];
+    } else if (Array.isArray(data)) {
+      products = data;
+    } else if (Array.isArray(data.products)) {
+      products = data.products;
+    } else if (Array.isArray(data.results)) {
+      products = data.results;
+    } else if (data.results && Array.isArray(data.results.results)) {
+      products = data.results.results;
+    } else if (data.data && Array.isArray(data.data.products)) {
+      products = data.data.products;
+    }
+
+    // Debug: show normalized products in console for easier troubleshooting
+    try {
+      console.debug('postToWebhook: normalized products count=', products.length, ' sample=', products && products.length ? products[0] : null);
+    } catch (e) { /* ignore */ }
+
+    // Return original data plus normalized products for callers
+    return Object.assign({}, data || {}, { products });
+  } catch (err) {
+    console.warn('Webhook call failed', err);
+    return null;
+  }
+}
+
 class ChatBubble {
   constructor() {
     // Config
@@ -149,27 +200,15 @@ class ChatBubble {
   }
 
   async sendToLLM(message) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 20000);
+    // Use webhook with { text } payload (webhook handles chat/LLM)
     try {
-      const res = await fetch(`${this.apiBaseUrl}/api/chat/llm`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message, sessionId: this.sessionId }),
-        signal: controller.signal,
-      });
-      clearTimeout(timeout);
-      if (!res.ok) {
-        const txt = await res.text().catch(() => "");
-        throw new Error("LLM HTTP error: " + res.status + " " + txt);
-      }
-      const data = await res.json();
-      return data.response || data.message || null;
+      const data = await postToWebhook({ text: message, sessionId: this.sessionId });
+      if (!data) return null;
+      if (typeof data === 'string') return data;
+      return data.response || data.reply || data.message || data.text || null;
     } catch (err) {
-      clearTimeout(timeout);
-      if (err.name === "AbortError")
-        throw new Error("LLM request timed out");
-      throw err;
+      console.warn('sendToLLM webhook error', err);
+      return null;
     }
   }
 
@@ -262,27 +301,23 @@ class ChatBubble {
 
   async loadChatHistory() {
     try {
-      const res = await fetch(
-        `${this.apiBaseUrl}/api/chat/${encodeURIComponent(this.sessionId)}`
-      );
-      if (!res.ok) return;
-      const data = await res.json();
-      if (!data || !Array.isArray(data.history)) return;
-      data.history.forEach((msg) => {
-        if (msg.role === "user") this.addMessage("user", msg.content);
-        else this.addMessage("assistant", msg.content);
+      // Use localStorage for history to avoid server dependency
+      const raw = localStorage.getItem(`cb_history_${this.sessionId}`);
+      if (!raw) return;
+      const history = JSON.parse(raw) || [];
+      history.forEach((msg) => {
+        if (msg.role === 'user') this.addMessage('user', msg.content);
+        else this.addMessage('assistant', msg.content);
       });
     } catch (err) {
-      console.warn("loadChatHistory failed", err);
+      console.warn('loadChatHistory failed', err);
     }
   }
 
   async loadStoreDomain() {
     try {
-      const res = await fetch(`${this.apiBaseUrl}/api/shopify/store`);
-      if (!res.ok) return;
-      const data = await res.json();
-      if (data && data.storeDomain) this.storeDomain = data.storeDomain;
+      // Derive store domain from current location to avoid server call
+      this.storeDomain = window.location.host;
     } catch (err) {
       // ignore
     }
@@ -329,7 +364,8 @@ class ChatBubble {
 
       const itemsHtml = products.slice(0, 8)
         .map((p) => {
-          const title = this.escapeText(p.title || "Untitled");
+          const rawTitle = p.title || p.name || p.handle || p.product_id || 'Untitled';
+          const title = this.escapeText(rawTitle);
           const handle = p.handle || "";
           const price =
             (p.variants && p.variants[0] && p.variants[0].price) ||
@@ -343,7 +379,8 @@ class ChatBubble {
               p.priceRange.minVariantPrice &&
               p.priceRange.minVariantPrice.currencyCode) ||
             "";
-          const img = resolveImageFromProduct(p) || '';
+          // Resolve image with helper; also tolerate common fields the webhook may return
+          const img = resolveImageFromProduct(p) || (p.image && (typeof p.image === 'string' ? p.image : (p.image.url || null))) || (p.featuredImage && (typeof p.featuredImage === 'string' ? p.featuredImage : (p.featuredImage.url || null))) || '';
           const href = this.buildProductUrl(handle);
           const addButton =
             p.variants &&
@@ -409,125 +446,55 @@ class ChatBubble {
     }
   }
 
-  // New: semantic search via server proxy -> vector-services
+  // New: semantic search via external webhook
   async searchProductsSemantic(query) {
     try {
-      const tryQuery = async (q) => {
-        const url = `${this.apiBaseUrl}/api/vector/search?query=${encodeURIComponent(q)}`;
-        console.log('searchProductsSemantic ->', url);
-        const res = await fetch(url, { method: 'GET' });
-        if (!res.ok) {
-          console.warn('searchProductsSemantic HTTP error', res.status);
-          return [];
-        }
-        const data = await res.json();
-        // Vector service may return { products: [...] } or { results: [...], total, next_cursor }
-        if (Array.isArray(data.products) && data.products.length) return data.products;
-        if (Array.isArray(data.results) && data.results.length) {
-          return data.results.map(r => ({
-            title: r.title || '',
-            handle: r.handle || (r.product_id ? String(r.product_id) : ''),
-            description: r.description || '',
-            tags: r.tags || [],
-            featuredImage: { url: r.image || '' },
-            variants: [],
-            _score: r.score,
-            _certainty: r.certainty,
-            product_id: r.product_id
-          }));
-        }
-        return [];
-      };
-
-      // First attempt: raw query
-      let products = await tryQuery(query);
-      if (products && products.length) return products;
-
-      // Second attempt: simple keyword extraction (strip stopwords / filler words)
-      const cleaned = (query || '')
-        .toLowerCase()
-        .replace(/[.,!?"'():]/g, ' ')
-        .replace(/\b(show|me|some|please|find|the|a|an|for|with|in|on|of|this|that|these|those|i|need|want)\b/gi, ' ')
-        .split(/\s+/)
-        .filter(t => t && t.length > 2)
-        .slice(0,6)
-        .join(' ');
-
-      if (cleaned && cleaned.length) {
-        console.log('searchProductsSemantic retry with cleaned keywords ->', cleaned);
-        products = await tryQuery(cleaned);
-      }
-
-      return products || [];
+      const data = await postToWebhook({ text: query });
+      if (!data) return [];
+      if (Array.isArray(data.products) && data.products.length) return data.products;
+      if (Array.isArray(data.results) && data.results.length) return data.results;
+      if (Array.isArray(data)) return data;
+      return [];
     } catch (err) {
-      console.warn('searchProductsSemantic failed', err);
+      console.warn('searchProductsSemantic webhook failed', err);
       return [];
     }
   }
 
   async searchProductsLLM(query) {
     try {
-      const res = await fetch(`${this.apiBaseUrl}/api/chat/llm_search`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: query }),
-      });
-      if (!res.ok) return [];
-      const data = await res.json();
-      return data.products || [];
+      const data = await postToWebhook({ text: query });
+      if (!data) return [];
+      return data.products || data.results || [];
     } catch (err) {
-      console.warn("searchProductsLLM failed", err);
+      console.warn('searchProductsLLM webhook failed', err);
       return [];
     }
   }
 
   async searchProductsDirect(query) {
     try {
-      const url = `${this.apiBaseUrl}/api/vector/search?query=${encodeURIComponent(query)}&limit=20&min_score=0.6`;
-      console.log('searchProductsDirect ->', url);
-  
-      const res = await fetch(url, { method: 'GET' });
-      if (!res.ok) {
-        console.warn('searchProductsDirect HTTP error', res.status);
-        return [];
-      }
-  
-      const data = await res.json();
-      console.log('searchProductsDirect raw data', data);
-  
-      // ✅ Handle the shape returned by your vector service ({ results: [...] })
-      if (Array.isArray(data.results)) {
-        return data.results.map(r => ({
-          product_id: r.product_id || r.id || null,
-          title: r.title || r.name || '',
-          handle: r.handle || '',
-          description: r.description || '',
-          tags: Array.isArray(r.tags) ? r.tags : [],
-          featuredImage: (r.featuredImage && { url: r.featuredImage.url, altText: r.featuredImage.altText }) || null,
-          variants: (r.variants && Array.isArray(r.variants) ? r.variants : []),
-          priceRange: r.priceRange || undefined,
-          _vector_meta: { score: r.score, certainty: r.certainty, raw: r }
-        }));
-      }
-  
-      // ✅ Fallback: if the vector service returns data.products
+      const data = await postToWebhook({ text: query });
+      if (!data) return [];
       if (Array.isArray(data.products)) return data.products;
-  
-      // ✅ Fallback: Shopify-style structure
-      if (data?.data?.products?.edges && Array.isArray(data.data.products.edges)) {
-        return data.data.products.edges.map(e => e.node || {});
-      }
-  
-      // ✅ If API returned array directly
+      if (Array.isArray(data.results)) return data.results.map(r => ({
+        product_id: r.product_id || r.id || null,
+        title: r.title || r.name || '',
+        handle: r.handle || '',
+        description: r.description || '',
+        tags: Array.isArray(r.tags) ? r.tags : [],
+        featuredImage: (r.featuredImage && { url: r.featuredImage.url, altText: r.featuredImage.altText }) || (r.image ? { url: r.image } : null),
+        variants: (r.variants && Array.isArray(r.variants) ? r.variants : []),
+        priceRange: r.priceRange || undefined,
+        _vector_meta: { score: r.score, certainty: r.certainty, raw: r }
+      }));
       if (Array.isArray(data)) return data;
-  
       return [];
     } catch (err) {
-      console.warn("searchProductsDirect failed", err);
+      console.warn('searchProductsDirect webhook failed', err);
       return [];
     }
   }
-  
 
   async getProducts() {
     try {

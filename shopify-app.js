@@ -72,6 +72,25 @@
     return null;
   }
 
+  // Use external webhook only for chat/search
+  const VECTOR_WEBHOOK_URL = 'https://sage.sumvec.com/n8n/webhook/search-vector';
+
+  async function postToWebhook(payload) {
+    try {
+      const res = await fetch(VECTOR_WEBHOOK_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) { console.warn('Webhook HTTP error', res.status); return null; }
+      const data = await res.json().catch(() => null);
+      return data;
+    } catch (err) {
+      console.warn('Webhook call failed', err);
+      return null;
+    }
+  }
+
   // Avoid double-loading
   if (window.__chatBubble_loader_loaded) {
     console.debug('shopify-app.js: loader already loaded');
@@ -182,14 +201,9 @@
     if (!window.chatBubble.sendToLLMChat) {
       window.chatBubble.sendToLLMChat = async function(message, sessionId = 'default') {
         try {
-          const resp = await fetch(`${this.apiBaseUrl}/api/chat/llm`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message, sessionId })
-          });
-          if (!resp.ok) { console.error('LLM chat HTTP error', resp.status); return null; }
-          const data = await resp.json();
-          return data.response || null;
+          const data = await postToWebhook({ type: 'chat', message, sessionId });
+          if (!data) return null;
+          return data.response || data.reply || null;
         } catch (err) {
           console.error('LLM chat error', err);
           return null;
@@ -200,14 +214,9 @@
     if (!window.chatBubble.searchProductsLLM) {
       window.chatBubble.searchProductsLLM = async function(message) {
         try {
-          const resp = await fetch(`${this.apiBaseUrl}/api/chat/llm_search`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message })
-          });
-          if (!resp.ok) { console.error('AI search HTTP error', resp.status); return []; }
-          const data = await resp.json();
-          return data.products || [];
+          const data = await postToWebhook({ type: 'search', query: message });
+          if (!data) { console.error('AI search HTTP error'); return []; }
+          return data.products || data.results || [];
         } catch (err) {
           console.error('AI-driven search error', err);
           return [];
@@ -215,16 +224,17 @@
       };
     }
 
-    // New: semantic vector search via server proxy -> vector-services
+    // New: semantic vector search via external webhook
     if (!window.chatBubble.searchProductsSemantic) {
       window.chatBubble.searchProductsSemantic = async function(message) {
         try {
-          const url = `${this.apiBaseUrl}/api/vector/search?query=${encodeURIComponent(message)}`;
-          const resp = await fetch(url, { method: 'GET' });
-          if (!resp.ok) { console.warn('Semantic search HTTP error', resp.status); return []; }
-          const data = await resp.json();
-          // vector service returns { intent, products }
-          return data.products || [];
+          const data = await postToWebhook({ type: 'search', query: message });
+          if (!data) { console.warn('Semantic search HTTP error'); return []; }
+          // Accept multiple response shapes
+          if (Array.isArray(data.products) && data.products.length) return data.products;
+          if (Array.isArray(data.results) && data.results.length) return data.results;
+          if (Array.isArray(data)) return data;
+          return [];
         } catch (err) {
           console.error('Semantic search error', err);
           return [];
@@ -233,20 +243,22 @@
     }
 
     if (!window.chatBubble.searchProductsDirect) {
-      // fallback: fetch products list from server and filter locally
+      // fallback: use webhook to fetch products
       window.chatBubble.searchProductsDirect = async function(query) {
         try {
-          const resp = await fetch(`${this.apiBaseUrl}/api/shopify/products`);
-          if (!resp.ok) { console.error('Direct search HTTP error', resp.status); return []; }
-          const data = await resp.json();
-          const products = Array.isArray(data.products) ? data.products : (data?.data?.products?.edges || []).map(e => e.node || {});
-          const q = (query || '').toLowerCase();
-          return products.filter(p => {
-            const title = (p.title || '').toLowerCase();
-            const desc = (p.description || '').toLowerCase();
-            const handle = (p.handle || '').toLowerCase();
-            return q.split(/\s+/).some(t => t && (title.includes(t) || desc.includes(t) || handle.includes(t)));
-          });
+          const data = await postToWebhook({ type: 'search', query });
+          if (!data) { console.error('Direct search HTTP error'); return []; }
+          if (Array.isArray(data.products)) return data.products;
+          if (Array.isArray(data.results)) return data.results.map(r => ({
+            id: r.product_id || r.id,
+            title: r.title || r.name || '',
+            handle: r.handle || '',
+            description: r.description || '',
+            featuredImage: r.image ? { url: r.image } : (r.featuredImage || null),
+            variants: r.variants || []
+          }));
+          if (Array.isArray(data)) return data;
+          return [];
         } catch (err) {
           console.error('Direct search error', err);
           return [];
