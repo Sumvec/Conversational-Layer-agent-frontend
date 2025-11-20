@@ -42,5 +42,5 @@ Create a .env (or .env.local) file in the project root. Example .env.example:
 Save your real values to .env. Do not commit .env to git — .gitignore already excludes it.
 
 Start the dev server:
-npm run dev
-# Open the app in the browser — the exact URL will appear in the console (commonly http://localhost:3000 or http://localhost:5173 depending on your setup).
+npm run dev:frontend
+# Open the app in the browser — the exact URL will appear in the console (commonly http://localhost:3000 or http://localhost:8000 depending on your setup).
