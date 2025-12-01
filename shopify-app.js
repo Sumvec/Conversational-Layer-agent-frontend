@@ -1,6 +1,8 @@
 // shopify-app.js — Chat bubble frontend loader for Shopify (compatible with original shape)
 // Lines: ~316
+require('dotenv').config();
 
+const VECTOR_WEBHOOK_URL = process.env.VECTOR_WEBHOOK_URL;
 (function() {
   'use strict';
 
@@ -73,7 +75,7 @@
   }
 
   // Use external webhook only for chat/search
-  const VECTOR_WEBHOOK_URL = 'https://sage.sumvec.com/n8n/webhook/search-vector';
+  // const VECTOR_WEBHOOK_URL = 'https://sage.sumvec.com/n8n/webhook/search-vector';
 
   async function postToWebhook(payload) {
     try {
