@@ -1,56 +1,23 @@
-version: '3.8'
-
+# docker-compose.yml (clean, production-like)
 services:
   chat-bubble:
-    build: .
-    ports:
-      - "3000:3000"
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sumvac/chat-bubble:latest
     environment:
       - NODE_ENV=production
       - PORT=3000
-      - OLLAMA_BASE_URL=http://ollama:11434
-      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.1:latest}
-      - GRAPHQL_ENDPOINT=${GRAPHQL_ENDPOINT}
-      - PYTHON_SERVICE_URL=http://python-service:5000
-      - SHOPIFY_SHOP_DOMAIN=${SHOPIFY_SHOP_DOMAIN}
-      - SHOPIFY_ACCESS_TOKEN=${SHOPIFY_ACCESS_TOKEN}
-    depends_on:
-      - python-service
-      - ollama
-    volumes:
-      - ./public:/app/public
-    restart: unless-stopped
-
-  python-service:
-    build:
-      context: .
-      dockerfile: Dockerfile.python
+      # If you do need to pass secrets at runtime, use an .env file or secret manager
+      # - GRAPHQL_ENDPOINT=${GRAPHQL_ENDPOINT:-}
+      # - SHOPIFY_SHOP_DOMAIN=${SHOPIFY_SHOP_DOMAIN:-}
+      # - SHOPIFY_ACCESS_TOKEN=${SHOPIFY_ACCESS_TOKEN:-}
     ports:
-      - "5000:5000"
-    environment:
-      - FLASK_ENV=production
-    volumes:
-      - ./python-service-example.py:/app/python-service-example.py
+      - "3000:3000"
     restart: unless-stopped
-
-  ollama:
-    image: ollama/ollama:latest
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama:/root/.ollama
-    restart: unless-stopped
-
-  # Optional: Add a database service
-  # postgres:
-  #   image: postgres:15
-  #   environment:
-  #     POSTGRES_DB: chatbubble
-  #     POSTGRES_USER: chatbubble
-  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-  #   volumes:
-  #     - postgres_data:/var/lib/postgresql/data
-  #   restart: unless-stopped
-
-# volumes:
-#   postgres_data:
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/health', (res) => { process.exit(res.statusCode === 200 ? 0 : 1) })"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
