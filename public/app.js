@@ -8,12 +8,16 @@ const VECTOR_WEBHOOK_URL = 'https://sage.sumvec.com/n8n/webhook/54d7b928-24cf-40
 async function postToWebhook(payload) {
   try {
     // Normalize payload to match Postman: { text: '...'}
-    const body = { text: payload && (payload.text || payload.message || payload.query || '') };
+    const body = { text: payload && (payload.text || payload.message || payload.query || '') || '' };
+    // Ensure sessionId always sent if present
     if (payload && payload.sessionId) body.sessionId = payload.sessionId;
 
     const res = await fetch(VECTOR_WEBHOOK_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Basic dGVzdDpzdW12ZWM=' },
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Basic dGVzdDpzdW12ZWM='
+      },
       body: JSON.stringify(body),
     });
 
@@ -23,38 +27,50 @@ async function postToWebhook(payload) {
       console.warn('Webhook HTTP error', res.status, text);
       return null;
     }
-    let data = await res.json().catch(() => null);
+
+    // Try to parse JSON; if fails, keep the raw text under .rawText
+    let data = null;
+    const textBody = await res.text().catch(() => '');
+    try {
+      data = textBody ? JSON.parse(textBody) : null;
+    } catch (e) {
+      // Not JSON — the webhook returned plain text (store it)
+      data = { rawText: textBody };
+    }
 
     if (!data) {
-      console.warn('Webhook returned empty response');
+      console.warn('Webhook returned empty response (no body)');
       return null;
     }
 
     console.log('🔄 Raw webhook response:', data);
 
-    // Handle if response is an array (e.g., [{ output: "..." }])
+    // If webhook returned an array like [{ output: "..." }], use first element
     if (Array.isArray(data) && data.length > 0) {
       console.log('📌 Response is array, using first element');
       data = data[0];
     }
 
-    // Parse output field if it's a string (may contain JSON or plain text)
-    let parsedOutput = data.output;
-    if (typeof parsedOutput === 'string') {
+    // If data.rawText exists and looks like JSON inside a string (e.g., output contains JSON),
+    // try to parse embedded JSON into parsedOutput.
+    let parsedOutput = null;
+    const possibleOutputStr = (data.output && typeof data.output === 'string' ? data.output : (data.rawText && typeof data.rawText === 'string' ? data.rawText : null));
+    if (possibleOutputStr) {
       try {
-        // Look for JSON structure in the string (handles cases where output has preamble text)
-        let jsonMatch = parsedOutput.match(/\{[\s\S]*\}/);
+        // Try brute-force JSON extraction inside a string (handles "output": "{...}" cases)
+        const jsonMatch = possibleOutputStr.match(/\{[\s\S]*\}/);
         if (jsonMatch) {
           parsedOutput = JSON.parse(jsonMatch[0]);
-          console.log('📦 Extracted and parsed JSON from output string:', parsedOutput);
+          console.log('📦 Extracted JSON from output/rawText:', parsedOutput);
         } else {
-          console.log('ℹ️ Output is plain text (no JSON found):', parsedOutput.substring(0, 100));
+          // store raw string as parsedOutput (so callers can use it uniformly)
+          parsedOutput = possibleOutputStr;
         }
       } catch (e) {
-        // If parsing fails, try as-is
-        console.warn('⚠️ Failed to parse output field:', e.message);
-        // Keep original string
+        parsedOutput = possibleOutputStr;
       }
+    } else if (data.parsedOutput) {
+      parsedOutput = data.parsedOutput;
     }
 
     // Normalize products array for many possible shapes
@@ -73,13 +89,10 @@ async function postToWebhook(payload) {
       products = parsedOutput;
     }
 
-    // Debug: show normalized products in console
-    if (products.length > 0) {
-      console.log('✓ Found', products.length, 'products');
-    }
+    if (products.length > 0) console.log('✓ Found', products.length, 'products');
 
-    // Return data with normalized products and parsed output
-    return Object.assign({}, data || {}, { products, parsedOutput });
+    // Merge back normalized pieces and return stable structure
+    return Object.assign({}, data, { products, parsedOutput });
   } catch (err) {
     console.warn('Webhook call failed', err);
     return null;
@@ -682,34 +695,89 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxyge
         await this.handleProductQuery(message);
       } else {
         // Get webhook response
-        const webhookData = await postToWebhook({ text: message, sessionId: this.sessionId });
-        const response = await this.sendToLLM(message);
-        this.hideTypingIndicator();
+       // Get webhook response (single call)
+       const webhookData = await postToWebhook({ text: message, sessionId: this.sessionId });
+       // DEBUG: show the exact webhook payload/shape so we can see why parsing went wrong
+       console.debug('webhookData (raw):', webhookData);
+       this.hideTypingIndicator();
+       
 
-        // If webhook returned structured parsedOutput prefer that flow: before_message -> products -> after_message
-        const po = webhookData && webhookData.parsedOutput ? webhookData.parsedOutput : null;
-        console.debug('webhookData:', webhookData, 'parsedOutput:', po);
-        if (po && (po.before_message || (webhookData && webhookData.products && webhookData.products.length) || po.after_message)) {
-          // Use the before_message as the header for product rendering when available
-          if (webhookData && webhookData.products && webhookData.products.length > 0) {
-            const header = po.before_message ? po.before_message : 'I found these products:';
-            console.log('📦 Displaying', webhookData.products.length, 'products from webhook with header:', header);
-            this.displayProducts(webhookData.products, header, po.after_message);
-          } else if (po.before_message || po.after_message) {
-            // No products but we have before/after messages -> render single assistant bubble
-            const combined = [po.before_message, po.after_message].filter(Boolean).join('\n\n');
-            this.addMessage("assistant", this.escapeText(combined));
-          }
-        } else if (response) {
-          // Fallback: show the linear response and any products
-          this.addMessage("assistant", this.escapeText(response));
-          if (webhookData && webhookData.products && webhookData.products.length > 0) {
-            console.log('📦 Displaying', webhookData.products.length, 'products from webhook');
-            this.displayProducts(webhookData.products);
-          }
-        } else {
-          this.addMessage("assistant", "Sorry, I didn't get a response. Please try again.");
-        }
+// Extract parsedOutput for structured flow
+const po = webhookData?.parsedOutput || null;
+
+// Try to extract a plain-text reply from multiple possible fields
+let webhookReply = null;
+const attemptFields = [
+  // Prefer structured 'po' fields first, but also include rawText and top-level output early
+  po?.before_message,
+  po?.reply,
+  po?.response,
+  po?.message,
+  // if webhook produced rawText (non-json) or plain output string, pick it up quickly
+  webhookData?.rawText,
+  webhookData?.output,
+  webhookData?.text,
+  webhookData?.reply,
+  webhookData?.response,
+  webhookData?.message,
+];
+
+
+for (const c of attemptFields) {
+  if (c && typeof c === "string" && c.trim()) {
+    webhookReply = c.trim();
+    break;
+  }
+}
+
+// 1) Structured product flow (before_message / products / after_message)
+if (
+  (po?.before_message || po?.after_message) ||
+  (webhookData?.products && webhookData.products.length)
+) {
+  const header = po?.before_message || "I found these products:";
+  if (webhookData.products?.length > 0) {
+    this.displayProducts(webhookData.products, header, po?.after_message || null);
+  } else {
+    const combined = [po?.before_message, po?.after_message].filter(Boolean).join("\n\n");
+    if (combined) this.addMessage("assistant", this.escapeText(combined));
+  }
+  return; // DONE — do not call LLM fallback // We use the strucutre response 
+}
+
+// 2) Plain text webhook reply — show immediately (NO second webhook call)
+if (webhookReply) {
+  const looksLikeHtml =
+    /<\/?(img|a|div|span|button)/i.test(webhookReply) ||
+    /!\[.*\]\(https?:\/\//i.test(webhookReply);
+
+  if (looksLikeHtml) {
+    const html = this._convertInlineMedia(webhookReply);
+    this.addHtmlMessage("assistant", html);
+  } else {
+    this.addMessage("assistant", this.escapeText(webhookReply));
+  }
+
+  // If webhook included products, show under the reply
+  if (webhookData.products?.length > 0) {
+    this.displayProducts(webhookData.products);
+  }
+
+  return; // DONE — we used the first webhook response
+}
+
+// 3) Fallback only when webhook returned NOTHING usable
+const response = await this.sendToLLM(message, webhookData);
+if (response) {
+  this.addMessage("assistant", this.escapeText(response));
+  // Show products if present
+  if (webhookData.products?.length > 0) {
+    this.displayProducts(webhookData.products);
+  }
+} else {
+  this.addMessage("assistant", "Sorry, I didn't get a response. Please try again.");
+}
+
       }
     } catch (err) {
       console.error("❌ sendMessage error", err);
@@ -720,52 +788,55 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxyge
     }
   }
 
-  async sendToLLM(message) {
-    // Use webhook with { text } payload (webhook handles chat/LLM)
+  async sendToLLM(message, webhookData = null) {
+    // Use existing webhookData if provided to avoid re-calling the webhook
     try {
-      const data = await postToWebhook({ text: message, sessionId: this.sessionId });
-      if (!data) return null;
-
-      // Try to extract response text from various possible fields
-      let responseText = null;
-
-      // Priority 1: Check for explicit response/reply/message fields at top level
-      if (data.response) {
-        responseText = data.response;
-      } else if (data.reply) {
-        responseText = data.reply;
-      } else if (data.message) {
-        responseText = data.message;
-      } else if (data.text) {
-        responseText = data.text;
+      let data = webhookData;
+      if (!data) {
+        data = await postToWebhook({ text: message, sessionId: this.sessionId });
       }
 
-      // Priority 2: Check inside parsed output (structured response with before_message, products, etc.)
+      // If still no usable data, bail out
+      if (!data || (typeof data === 'object' && data.ok === false && !data.data && !data.output && !data.parsedOutput && !data.rawText)) {
+        console.debug('sendToLLM: no usable webhook data', data);
+        return null;
+      }
+
+      // Try to extract response text from various possible fields (prioritized)
+      let responseText = null;
+
+      // Top-level explicit fields
+      if (data.response) responseText = data.response;
+      else if (data.reply) responseText = data.reply;
+      else if (data.message) responseText = data.message;
+      else if (data.text) responseText = data.text;
+
+      // parsedOutput object/string
       else if (data.parsedOutput) {
         if (typeof data.parsedOutput === 'string') {
           responseText = data.parsedOutput;
         } else {
-          // For structured responses, prefer before_message (intro for product searches)
-          if (data.parsedOutput.before_message) {
-            responseText = data.parsedOutput.before_message;
-          } else if (data.parsedOutput.reply) {
-            responseText = data.parsedOutput.reply;
-          } else if (data.parsedOutput.response) {
-            responseText = data.parsedOutput.response;
-          } else if (data.parsedOutput.output) {
-            responseText = data.parsedOutput.output;
-          } else if (data.parsedOutput.message) {
-            responseText = data.parsedOutput.message;
-          }
+          responseText =
+            data.parsedOutput.before_message ||
+            data.parsedOutput.reply ||
+            data.parsedOutput.response ||
+            data.parsedOutput.output ||
+            data.parsedOutput.message ||
+            null;
         }
       }
 
-      // Priority 3: Check output field directly (plain string)
+      // output top-level (string)
       else if (data.output && typeof data.output === 'string') {
         responseText = data.output;
       }
 
-      // Priority 4: If we have products but no message, generate one
+      // rawText fallback (webhook returned non-JSON plain text earlier)
+      else if (data.rawText && typeof data.rawText === 'string') {
+        responseText = data.rawText;
+      }
+
+      // products -> generate a short user-friendly string
       else if (data.products && data.products.length > 0) {
         responseText = `Found ${data.products.length} product(s) for you!`;
       }
@@ -775,13 +846,14 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxyge
         return null;
       }
 
-      console.log('✓ Extracted response text:', responseText.substring(0, 100));
+      console.log('✓ Extracted response text:', String(responseText).substring(0, 200));
       return responseText;
     } catch (err) {
-      console.warn('❌ sendToLLM webhook error', err);
+      console.warn('❌ sendToLLM error', err);
       return null;
     }
   }
+
 
   addMessage(role, content) {
     // For assistant messages, detect markdown image/link syntax and raw image URLs
@@ -949,14 +1021,45 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxyge
 
   isProductQuery(msg) {
     if (!msg) return false;
-    const q = msg.toLowerCase();
-    const keywords = [
-      "find","search","show","product","items","catalog",
-      "shoes","shirt","shirts","dress","pants","buy",
-      "price","size","color","under","below","less"
+    const q = msg.trim().toLowerCase();
+
+    // If it starts with a question word, treat it as a conversational question (not a product search)
+    const questionWords = ["why", "what", "how", "when", "where", "who", "did", "does", "do", "is", "are", "was", "were"];
+    for (const w of questionWords) {
+      if (q.startsWith(w + " ") || q === w) return false;
+    }
+
+    // Look for explicit product-search verbs (with optional "me" or product descriptor).
+    // This reduces false-positive matches from nouns alone.
+    const productVerbs = [
+      "show me",
+      "show",
+      "find me",
+      "find",
+      "search for",
+      "search",
+      "list",
+      "browse",
+      "search products",
+      "show products",
+      "show item",
+      "show items"
     ];
-    return keywords.some((k) => q.includes(k));
+
+    for (const v of productVerbs) {
+      if (q.includes(v)) {
+        // guard: if it's a short question like "show?" ignore
+        if (q.length <= v.length + 1) return false;
+        return true;
+      }
+    }
+
+    // Additional heuristic: "I want" or "looking for" -> product intent
+    if (/\b(i want|i'd like|i would like|looking for|need|want|buy)\b/.test(q)) return true;
+
+    return false;
   }
+
 
   async handleProductQuery(message) {
     try {
@@ -1416,7 +1519,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxyge
 
   // Add unmount method to remove markup and potential listeners
   unmount() {
-    // Remove chat markup
+    // Remove chat markup and also any global event listeners if added
     const root = document.getElementById("cb-root"); 
     if (root && root.parentNode) root.parentNode.removeChild(root);
 
