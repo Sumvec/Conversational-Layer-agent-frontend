@@ -12,7 +12,7 @@ const prompts = require('./prompts');
 // const weaviateUtils = require('./weaviate');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 7007;
 
 // Middleware
 app.use(cors({ origin: true, credentials: true }));
@@ -454,3 +454,4 @@ app.listen(PORT, () => {
   console.log(`💬 Chat Bubble Server running on http://localhost:${PORT}`);
   console.log(`⚙️ Health: http://localhost:${PORT}/health`);
 });
+
