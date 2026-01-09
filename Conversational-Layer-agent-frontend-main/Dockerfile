@@ -42,7 +42,7 @@
   USER nodejs
   
   # Expose app port
-  EXPOSE 7007,7008,7009
+  EXPOSE 7007
   
   # Healthcheck endpoint (adjust if your server uses a different path)
   HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
