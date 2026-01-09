@@ -1,0 +1,25 @@
+version: "3.9"
+
+services:
+  chat-bubble:
+    image: sumvac/chat-bubble:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    environment:
+      - NODE_ENV=production
+      - PORT=7007
+
+    ports:
+      - "7007:7007"
+
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:7007/health', r => process.exit(r.statusCode===200?0:1))"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
